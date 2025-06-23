@@ -111,7 +111,6 @@ function runClaudeCodeOnWindows({
 		fileArgs.push("--model", modelId)
 	}
 
-	let l = fileArgs.join(" ")
 	// Create the process
 	const childProcess = execa("wsl", [claudePath, ...fileArgs], {
 		stdin: "ignore",
