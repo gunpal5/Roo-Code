@@ -97,6 +97,14 @@ type ProcessState = {
 }
 
 export async function* runClaudeCode(options: ClaudeCodeOptions): AsyncGenerator<ClaudeCodeMessage | string> {
+	// Validate inputs
+	if (!options.systemPrompt || typeof options.systemPrompt !== "string") {
+		throw new Error("systemPrompt is required and must be a string")
+	}
+	if (!options.messages || !Array.isArray(options.messages) || options.messages.length === 0) {
+		throw new Error("messages is required and must be a non-empty array")
+	}
+
 	const process = runProcess(options)
 
 	const rl = readline.createInterface({
@@ -252,27 +260,35 @@ function runClaudeCodeOnWindows({
 		fileArgs.push("--model", modelId)
 	}
 
-	// Create the process
-	const childProcess = execa("wsl", [claudePath, ...fileArgs], {
-		stdin: "ignore",
-		stdout: "pipe",
-		stderr: "pipe",
-		env: {
-			...process.env,
-			// The default is 32000. However, I've gotten larger responses, so we increase it unless the user specified it.
-			CLAUDE_CODE_MAX_OUTPUT_TOKENS: process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS || "64000",
-		},
-		cwd,
-		maxBuffer: 1024 * 1024 * 1000,
-		timeout: CLAUDE_CODE_TIMEOUT,
-	})
+	try {
+		// Create the process
+		const childProcess = execa("wsl", [claudePath, ...fileArgs], {
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "pipe",
+			env: {
+				...process.env,
+				// The default is 32000. However, I've gotten larger responses, so we increase it unless the user specified it.
+				CLAUDE_CODE_MAX_OUTPUT_TOKENS: process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS || "64000",
+			},
+			cwd,
+			maxBuffer: 1024 * 1024 * 1000,
+			timeout: CLAUDE_CODE_TIMEOUT,
+		})
 
-	// Clean up temporary files when the process exits
-	childProcess.finally(() => {
+		// Clean up temporary files when the process exits
+		childProcess.finally(() => {
+			tempFiles.cleanup()
+		})
+
+		return childProcess
+	} catch (error) {
+		// Clean up temp files if WSL execution fails
 		tempFiles.cleanup()
-	})
-
-	return childProcess
+		throw new Error(
+			`Failed to execute Claude CLI via WSL: ${error instanceof Error ? error.message : String(error)}. Make sure WSL is installed and configured properly.`,
+		)
+	}
 }
 
 /**
