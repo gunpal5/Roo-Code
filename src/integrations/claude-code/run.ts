@@ -3,6 +3,82 @@ import type Anthropic from "@anthropic-ai/sdk"
 import { execa } from "execa"
 import { ClaudeCodeMessage } from "./types"
 import readline from "readline"
+import * as fs from "fs"
+import * as path from "path"
+import * as os from "os"
+
+/**
+ * Converts a Windows path to a WSL-compatible path
+ * @param windowsPath The Windows path to convert
+ * @returns The WSL-compatible path
+ */
+function convertWindowsPathToWsl(windowsPath: string): string {
+	// Validate that this is a Windows absolute path with drive letter
+	if (!windowsPath || windowsPath.length < 3 || windowsPath.charAt(1) !== ":") {
+		throw new Error(`Invalid Windows path format: ${windowsPath}`)
+	}
+
+	// Remove drive letter and convert backslashes to forward slashes
+	const driveLetter = windowsPath.charAt(0).toLowerCase()
+	const pathWithoutDrive = windowsPath.substring(2).replace(/\\/g, "/")
+	return `/mnt/${driveLetter}${pathWithoutDrive}`
+}
+
+/**
+ * Creates temporary files for Claude CLI input and returns their paths
+ * @param cwd The current working directory
+ * @param messages The messages to write to a file
+ * @param systemPrompt The system prompt to write to a file
+ * @returns Object containing paths to the temporary files and a cleanup function
+ */
+function createTemporaryFiles(
+	cwd: string | undefined,
+	messages: Anthropic.Messages.MessageParam[],
+	systemPrompt: string,
+) {
+	// Always use system temp directory to avoid workspace pollution
+	const tempDirPath = path.join(os.tmpdir(), ".claude-code-temp")
+
+	// Create the directory if it doesn't exist
+	if (!fs.existsSync(tempDirPath)) {
+		fs.mkdirSync(tempDirPath, { recursive: true })
+	}
+
+	// Create unique filenames with process PID to avoid collisions
+	const timestamp = Date.now()
+	const pid = process.pid
+	const messagesFilePath = path.join(tempDirPath, `messages-${timestamp}-${pid}.json`)
+	const systemPromptFilePath = path.join(tempDirPath, `system-prompt-${timestamp}-${pid}.txt`)
+
+	// Write the files
+	fs.writeFileSync(messagesFilePath, JSON.stringify(messages), "utf8")
+	fs.writeFileSync(systemPromptFilePath, systemPrompt, "utf8")
+
+	// Return paths and cleanup function
+	return {
+		messagesFilePath,
+		systemPromptFilePath,
+		cleanup: () => {
+			try {
+				fs.unlinkSync(messagesFilePath)
+				fs.unlinkSync(systemPromptFilePath)
+
+				// Try to remove the directory if it's empty (use newer rmSync)
+				try {
+					const files = fs.readdirSync(tempDirPath)
+					if (files.length === 0) {
+						fs.rmSync(tempDirPath, { recursive: true })
+					}
+				} catch (dirError) {
+					// Directory might not be empty or already removed, which is fine
+				}
+			} catch (error) {
+				console.error("Error cleaning up temporary Claude CLI files:", error)
+				// Don't re-throw to avoid breaking the main process
+			}
+		},
+	}
+}
 
 const cwd = vscode.workspace.workspaceFolders?.map((folder) => folder.uri.fsPath).at(0)
 
@@ -109,7 +185,115 @@ const CLAUDE_CODE_TIMEOUT = 600000 // 10 minutes
 
 function runProcess({ systemPrompt, messages, path, modelId }: ClaudeCodeOptions) {
 	const claudePath = path || "claude"
+	const isWindows = process.platform === "win32"
+	const cwd = vscode.workspace.workspaceFolders?.map((folder) => folder.uri.fsPath).at(0)
 
+	// Dispatch to the appropriate platform-specific method
+	if (isWindows) {
+		return runClaudeCodeOnWindows({
+			systemPrompt,
+			messages,
+			claudePath,
+			modelId,
+			cwd,
+		})
+	} else {
+		return runClaudeCodeOnNonWindows({
+			systemPrompt,
+			messages,
+			claudePath,
+			modelId,
+			cwd,
+		})
+	}
+}
+
+/**
+ * Runs Claude CLI on Windows using WSL
+ * @param params Parameters for running Claude CLI
+ * @returns Execa process
+ */
+function runClaudeCodeOnWindows({
+	systemPrompt,
+	messages,
+	claudePath,
+	modelId,
+	cwd,
+}: {
+	systemPrompt: string
+	messages: Anthropic.Messages.MessageParam[]
+	claudePath: string
+	modelId?: string
+	cwd?: string
+}) {
+	// Create temporary files for messages and system prompt
+	const tempFiles = createTemporaryFiles(cwd, messages, systemPrompt)
+
+	// Convert Windows paths to WSL paths
+	const wslMessagesPath = convertWindowsPathToWsl(tempFiles.messagesFilePath)
+	const wslSystemPromptPath = convertWindowsPathToWsl(tempFiles.systemPromptFilePath)
+
+	// Modify args to use file paths instead of raw JSON
+	const fileArgs = [
+		"-p",
+		`@${wslMessagesPath}`,
+		"--system-prompt",
+		`@${wslSystemPromptPath}`,
+		"--verbose",
+		"--output-format",
+		"stream-json",
+		"--disallowedTools",
+		claudeCodeTools,
+		"--max-turns",
+		"1",
+	]
+
+	if (modelId) {
+		fileArgs.push("--model", modelId)
+	}
+
+	// Create the process
+	const childProcess = execa("wsl", [claudePath, ...fileArgs], {
+		stdin: "ignore",
+		stdout: "pipe",
+		stderr: "pipe",
+		env: {
+			...process.env,
+			// The default is 32000. However, I've gotten larger responses, so we increase it unless the user specified it.
+			CLAUDE_CODE_MAX_OUTPUT_TOKENS: process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS || "64000",
+		},
+		cwd,
+		maxBuffer: 1024 * 1024 * 1000,
+		timeout: CLAUDE_CODE_TIMEOUT,
+	})
+
+	// Clean up temporary files when the process exits
+	childProcess.finally(() => {
+		tempFiles.cleanup()
+	})
+
+	return childProcess
+}
+
+/**
+ * Runs Claude CLI on non-Windows platforms
+ * @param params Parameters for running Claude CLI
+ * @returns Execa process
+ */
+function runClaudeCodeOnNonWindows({
+	systemPrompt,
+	messages,
+	claudePath,
+	modelId,
+	cwd,
+}: {
+	systemPrompt: string
+	messages: Anthropic.Messages.MessageParam[]
+	claudePath: string
+	modelId?: string
+	cwd?: string
+}) {
+	// Create args for Claude CLI
 	const args = [
 		"-p",
 		JSON.stringify(messages),
