@@ -187,7 +187,7 @@ const claudeCodeTools = [
 	"TodoRead",
 	"TodoWrite",
 	"WebSearch",
-].join(",")
+].join(" ") //Tools are space separated: https://docs.anthropic.com/en/docs/claude-code/sdk#available-cli-options
 
 const CLAUDE_CODE_TIMEOUT = 600000 // 10 minutes
 
