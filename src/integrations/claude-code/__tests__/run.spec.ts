@@ -41,21 +41,19 @@ describe("runClaudeCode", () => {
 	test("should validate input parameters", async () => {
 		const { runClaudeCode } = await import("../run")
 
-		// Test invalid systemPrompt
-		expect(() => {
-			runClaudeCode({
-				systemPrompt: "",
-				messages: [{ role: "user", content: "test" }],
-			})
-		}).toThrow("systemPrompt is required and must be a string")
+		// Test invalid systemPrompt - should throw when generator is consumed
+		const generator1 = runClaudeCode({
+			systemPrompt: "",
+			messages: [{ role: "user", content: "test" }],
+		})
+		await expect(generator1.next()).rejects.toThrow("systemPrompt is required and must be a string")
 
-		// Test invalid messages
-		expect(() => {
-			runClaudeCode({
-				systemPrompt: "test",
-				messages: [],
-			})
-		}).toThrow("messages is required and must be a non-empty array")
+		// Test invalid messages - should throw when generator is consumed
+		const generator2 = runClaudeCode({
+			systemPrompt: "test",
+			messages: [],
+		})
+		await expect(generator2.next()).rejects.toThrow("messages is required and must be a non-empty array")
 	})
 
 	test("should handle Windows path conversion correctly", () => {
