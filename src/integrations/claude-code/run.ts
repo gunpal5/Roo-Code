@@ -114,7 +114,7 @@ const claudeCodeTools = [
 	"TodoRead",
 	"TodoWrite",
 	"WebSearch",
-].join(" ")
+].join(",")
 
 const CLAUDE_CODE_TIMEOUT = 600000 // 10 minutes
 
