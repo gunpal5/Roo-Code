@@ -1,7 +1,4 @@
 import { describe, test, expect, vi, beforeEach } from "vitest"
-import * as fs from "fs"
-import * as path from "path"
-import * as os from "os"
 
 // Mock vscode workspace
 vi.mock("vscode", () => ({
@@ -16,9 +13,92 @@ vi.mock("vscode", () => ({
 	},
 }))
 
+// Mock execa to test stdin behavior
+const mockExeca = vi.fn()
+const mockStdin = {
+	write: vi.fn((data, encoding, callback) => {
+		// Simulate successful write
+		if (callback) callback(null)
+	}),
+	end: vi.fn(),
+}
+
+// Mock process that simulates successful execution
+const createMockProcess = () => {
+	let resolveProcess: (value: { exitCode: number }) => void
+	const processPromise = new Promise<{ exitCode: number }>((resolve) => {
+		resolveProcess = resolve
+	})
+
+	const mockProcess = {
+		stdin: mockStdin,
+		stdout: {
+			on: vi.fn(),
+		},
+		stderr: {
+			on: vi.fn((event, callback) => {
+				// Don't emit any stderr data in tests
+			}),
+		},
+		on: vi.fn((event, callback) => {
+			if (event === "close") {
+				// Simulate successful process completion after a short delay
+				setTimeout(() => {
+					callback(0)
+					resolveProcess({ exitCode: 0 })
+				}, 10)
+			}
+			if (event === "error") {
+				// Don't emit any errors in tests
+			}
+		}),
+		killed: false,
+		kill: vi.fn(),
+		then: processPromise.then.bind(processPromise),
+		catch: processPromise.catch.bind(processPromise),
+		finally: processPromise.finally.bind(processPromise),
+	}
+	return mockProcess
+}
+
+vi.mock("execa", () => ({
+	execa: mockExeca,
+}))
+
+// Mock readline with proper interface simulation
+let mockReadlineInterface: any = null
+
+vi.mock("readline", () => ({
+	default: {
+		createInterface: vi.fn(() => {
+			mockReadlineInterface = {
+				async *[Symbol.asyncIterator]() {
+					// Simulate Claude CLI JSON output
+					yield '{"type":"text","text":"Hello"}'
+					yield '{"type":"text","text":" world"}'
+					// Simulate end of stream - must return to terminate the iterator
+					return
+				},
+				close: vi.fn(),
+			}
+			return mockReadlineInterface
+		}),
+	},
+}))
+
 describe("runClaudeCode", () => {
 	beforeEach(() => {
 		vi.clearAllMocks()
+		mockExeca.mockReturnValue(createMockProcess())
+		// Mock setImmediate to run synchronously in tests
+		vi.spyOn(global, "setImmediate").mockImplementation((callback: any) => {
+			callback()
+			return {} as any
+		})
+	})
+
+	afterEach(() => {
+		vi.restoreAllMocks()
 	})
 
 	test("should export runClaudeCode function", async () => {
@@ -38,70 +118,173 @@ describe("runClaudeCode", () => {
 		expect(typeof result[Symbol.asyncIterator]).toBe("function")
 	})
 
-	test("should validate input parameters", async () => {
+	test("should use stdin instead of command line arguments for messages", async () => {
+		const { runClaudeCode } = await import("../run")
+		const messages = [{ role: "user" as const, content: "Hello world!" }]
+		const options = {
+			systemPrompt: "You are a helpful assistant",
+			messages,
+		}
+
+		const generator = runClaudeCode(options)
+
+		// Consume the generator to completion
+		const results = []
+		for await (const chunk of generator) {
+			results.push(chunk)
+		}
+
+		// Verify execa was called with correct arguments (no JSON.stringify(messages) in args)
+		expect(mockExeca).toHaveBeenCalledWith(
+			"claude",
+			expect.arrayContaining([
+				"-p",
+				"--system-prompt",
+				"You are a helpful assistant",
+				"--verbose",
+				"--output-format",
+				"stream-json",
+				"--disallowedTools",
+				expect.any(String),
+				"--max-turns",
+				"1",
+			]),
+			expect.objectContaining({
+				stdin: "pipe",
+				stdout: "pipe",
+				stderr: "pipe",
+			}),
+		)
+
+		// Verify the arguments do NOT contain the stringified messages
+		const [, args] = mockExeca.mock.calls[0]
+		expect(args).not.toContain(JSON.stringify(messages))
+
+		// Verify messages were written to stdin with callback
+		expect(mockStdin.write).toHaveBeenCalledWith(JSON.stringify(messages), "utf8", expect.any(Function))
+		expect(mockStdin.end).toHaveBeenCalled()
+
+		// Verify we got the expected mock output
+		expect(results).toHaveLength(2)
+		expect(results[0]).toEqual({ type: "text", text: "Hello" })
+		expect(results[1]).toEqual({ type: "text", text: " world" })
+	})
+
+	test("should include model parameter when provided", async () => {
+		const { runClaudeCode } = await import("../run")
+		const options = {
+			systemPrompt: "You are a helpful assistant",
+			messages: [{ role: "user" as const, content: "Hello" }],
+			modelId: "claude-3-5-sonnet-20241022",
+		}
+
+		const generator = runClaudeCode(options)
+
+		// Consume at least one item to trigger process spawn
+		await generator.next()
+
+		// Clean up the generator
+		await generator.return(undefined)
+
+		const [, args] = mockExeca.mock.calls[0]
+		expect(args).toContain("--model")
+		expect(args).toContain("claude-3-5-sonnet-20241022")
+	})
+
+	test("should use custom claude path when provided", async () => {
+		const { runClaudeCode } = await import("../run")
+		const options = {
+			systemPrompt: "You are a helpful assistant",
+			messages: [{ role: "user" as const, content: "Hello" }],
+			path: "/custom/path/to/claude",
+		}
+
+		const generator = runClaudeCode(options)
+
+		// Consume at least one item to trigger process spawn
+		await generator.next()
+
+		// Clean up the generator
+		await generator.return(undefined)
+
+		const [claudePath] = mockExeca.mock.calls[0]
+		expect(claudePath).toBe("/custom/path/to/claude")
+	})
+
+	test("should handle stdin write errors gracefully", async () => {
 		const { runClaudeCode } = await import("../run")
 
-		// Test invalid systemPrompt - should throw when generator is consumed
-		const generator1 = runClaudeCode({
-			systemPrompt: "",
-			messages: [{ role: "user", content: "test" }],
+		// Create a mock process with stdin that fails
+		const mockProcessWithError = createMockProcess()
+		mockProcessWithError.stdin.write = vi.fn((data, encoding, callback) => {
+			// Simulate write error
+			if (callback) callback(new Error("EPIPE: broken pipe"))
 		})
-		await expect(generator1.next()).rejects.toThrow("systemPrompt is required and must be a string")
 
-		// Test invalid messages - should throw when generator is consumed
-		const generator2 = runClaudeCode({
-			systemPrompt: "test",
-			messages: [],
-		})
-		await expect(generator2.next()).rejects.toThrow("messages is required and must be a non-empty array")
+		// Mock console.error to verify error logging
+		const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
+
+		mockExeca.mockReturnValueOnce(mockProcessWithError)
+
+		const options = {
+			systemPrompt: "You are a helpful assistant",
+			messages: [{ role: "user" as const, content: "Hello" }],
+		}
+
+		const generator = runClaudeCode(options)
+
+		// Try to consume the generator
+		try {
+			await generator.next()
+		} catch (error) {
+			// Expected to fail
+		}
+
+		// Verify error was logged
+		expect(consoleErrorSpy).toHaveBeenCalledWith("Error writing to Claude Code stdin:", expect.any(Error))
+
+		// Verify process was killed
+		expect(mockProcessWithError.kill).toHaveBeenCalled()
+
+		// Clean up
+		consoleErrorSpy.mockRestore()
+		await generator.return(undefined)
 	})
 
-	test("should handle Windows path conversion correctly", () => {
-		// Test the convertWindowsPathToWsl function indirectly
-		// Since it's not exported, we'll test the behavior through integration
+	test("should handle stdin access errors gracefully", async () => {
+		const { runClaudeCode } = await import("../run")
 
-		// Mock process.platform to simulate Windows
-		const originalPlatform = process.platform
-		Object.defineProperty(process, "platform", {
-			value: "win32",
-		})
+		// Create a mock process without stdin
+		const mockProcessWithoutStdin = createMockProcess()
+		mockProcessWithoutStdin.stdin = null as any
 
-		// Test valid Windows paths
-		const validPaths = [
-			"C:\\Users\\test\\file.txt",
-			"D:\\Projects\\myproject\\src\\index.js",
-			"E:\\temp\\data.json",
-		]
+		// Mock console.error to verify error logging
+		const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => {})
 
-		// We can't directly test the internal function, but we can verify
-		// that the Windows code path doesn't throw errors with valid paths
-		validPaths.forEach((testPath) => {
-			expect(() => {
-				// This would be called internally by runClaudeCodeOnWindows
-				const driveLetter = testPath.charAt(0).toLowerCase()
-				const pathWithoutDrive = testPath.substring(2).replace(/\\/g, "/")
-				const wslPath = `/mnt/${driveLetter}${pathWithoutDrive}`
-				expect(wslPath).toMatch(/^\/mnt\/[a-z]\//)
-			}).not.toThrow()
-		})
+		mockExeca.mockReturnValueOnce(mockProcessWithoutStdin)
 
-		// Restore original platform
-		Object.defineProperty(process, "platform", {
-			value: originalPlatform,
-		})
-	})
+		const options = {
+			systemPrompt: "You are a helpful assistant",
+			messages: [{ role: "user" as const, content: "Hello" }],
+		}
 
-	test("should create unique temporary file names", () => {
-		// Test that temporary files have unique names
-		const tempDir = os.tmpdir()
-		const timestamp1 = Date.now()
-		const pid = process.pid
+		const generator = runClaudeCode(options)
 
-		const file1 = path.join(tempDir, `messages-${timestamp1}-${pid}.json`)
-		const file2 = path.join(tempDir, `messages-${timestamp1 + 1}-${pid}.json`)
+		// Try to consume the generator
+		try {
+			await generator.next()
+		} catch (error) {
+			// Expected to fail
+		}
 
-		expect(file1).not.toBe(file2)
-		expect(file1).toContain(String(pid))
-		expect(file2).toContain(String(pid))
+		// Verify error was logged
+		expect(consoleErrorSpy).toHaveBeenCalledWith("Error accessing Claude Code stdin:", expect.any(Error))
+
+		// Verify process was killed
+		expect(mockProcessWithoutStdin.kill).toHaveBeenCalled()
+
+		// Clean up
+		consoleErrorSpy.mockRestore()
+		await generator.return(undefined)
 	})
 })
