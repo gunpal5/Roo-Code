@@ -164,7 +164,7 @@ describePlatform("Windows WSL Integration", () => {
 				expect(fs.readdirSync).toHaveBeenCalledWith("C:\\temp\\.claude-code-temp")
 			} finally {
 				// Clean up the generator
-				await generator.return()
+				await generator.return(undefined)
 			}
 		} finally {
 			// Restore original platform
@@ -205,7 +205,7 @@ describePlatform("Windows WSL Integration", () => {
 				)
 			} finally {
 				// Clean up the generator
-				await generator.return()
+				await generator.return(undefined)
 			}
 		} finally {
 			// Restore original platform
