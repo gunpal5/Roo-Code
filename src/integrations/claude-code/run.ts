@@ -7,79 +7,6 @@ import * as fs from "fs"
 import * as path from "path"
 import * as os from "os"
 
-/**
- * Converts a Windows path to a WSL-compatible path
- * @param windowsPath The Windows path to convert
- * @returns The WSL-compatible path
- */
-function convertWindowsPathToWsl(windowsPath: string): string {
-	// Validate that this is a Windows absolute path with drive letter
-	if (!windowsPath || windowsPath.length < 3 || windowsPath.charAt(1) !== ":") {
-		throw new Error(`Invalid Windows path format: ${windowsPath}`)
-	}
-
-	// Remove drive letter and convert backslashes to forward slashes
-	const driveLetter = windowsPath.charAt(0).toLowerCase()
-	const pathWithoutDrive = windowsPath.substring(2).replace(/\\/g, "/")
-	return `/mnt/${driveLetter}${pathWithoutDrive}`
-}
-
-/**
- * Creates temporary files for Claude CLI input and returns their paths
- * @param cwd The current working directory
- * @param messages The messages to write to a file
- * @param systemPrompt The system prompt to write to a file
- * @returns Object containing paths to the temporary files and a cleanup function
- */
-function createTemporaryFiles(
-	cwd: string | undefined,
-	messages: Anthropic.Messages.MessageParam[],
-	systemPrompt: string,
-) {
-	// Always use system temp directory to avoid workspace pollution
-	const tempDirPath = path.join(os.tmpdir(), ".claude-code-temp")
-
-	// Create the directory if it doesn't exist
-	if (!fs.existsSync(tempDirPath)) {
-		fs.mkdirSync(tempDirPath, { recursive: true })
-	}
-
-	// Create unique filenames with process PID to avoid collisions
-	const timestamp = Date.now()
-	const pid = process.pid
-	const messagesFilePath = path.join(tempDirPath, `messages-${timestamp}-${pid}.json`)
-	const systemPromptFilePath = path.join(tempDirPath, `system-prompt-${timestamp}-${pid}.txt`)
-
-	// Write the files
-	fs.writeFileSync(messagesFilePath, JSON.stringify(messages), "utf8")
-	fs.writeFileSync(systemPromptFilePath, systemPrompt, "utf8")
-
-	// Return paths and cleanup function
-	return {
-		messagesFilePath,
-		systemPromptFilePath,
-		cleanup: () => {
-			try {
-				fs.unlinkSync(messagesFilePath)
-				fs.unlinkSync(systemPromptFilePath)
-
-				// Try to remove the directory if it's empty (use newer rmSync)
-				try {
-					const files = fs.readdirSync(tempDirPath)
-					if (files.length === 0) {
-						fs.rmSync(tempDirPath, { recursive: true })
-					}
-				} catch (dirError) {
-					// Directory might not be empty or already removed, which is fine
-				}
-			} catch (error) {
-				console.error("Error cleaning up temporary Claude CLI files:", error)
-				// Don't re-throw to avoid breaking the main process
-			}
-		},
-	}
-}
-
 const cwd = vscode.workspace.workspaceFolders?.map((folder) => folder.uri.fsPath).at(0)
 
 type ClaudeCodeOptions = {
@@ -187,7 +114,7 @@ const claudeCodeTools = [
 	"TodoRead",
 	"TodoWrite",
 	"WebSearch",
-].join(" ") //Tools are space separated: https://docs.anthropic.com/en/docs/claude-code/sdk#available-cli-options
+].join(" ")
 
 const CLAUDE_CODE_TIMEOUT = 600000 // 10 minutes
 
@@ -234,6 +161,79 @@ function runClaudeCodeOnWindows({
 	modelId?: string
 	cwd?: string
 }) {
+	/**
+	 * Creates temporary files for Claude CLI input and returns their paths
+	 * @param cwd The current working directory
+	 * @param messages The messages to write to a file
+	 * @param systemPrompt The system prompt to write to a file
+	 * @returns Object containing paths to the temporary files and a cleanup function
+	 */
+	const createTemporaryFiles = (
+		cwd: string | undefined,
+		messages: Anthropic.Messages.MessageParam[],
+		systemPrompt: string,
+	) => {
+		// Always use system temp directory to avoid workspace pollution
+		const tempDirPath = path.join(os.tmpdir(), ".claude-code-temp")
+
+		// Create the directory if it doesn't exist
+		if (!fs.existsSync(tempDirPath)) {
+			fs.mkdirSync(tempDirPath, { recursive: true })
+		}
+
+		// Create unique filenames with process PID to avoid collisions
+		const timestamp = Date.now()
+		const pid = process.pid
+		const messagesFilePath = path.join(tempDirPath, `messages-${timestamp}-${pid}.json`)
+		const systemPromptFilePath = path.join(tempDirPath, `system-prompt-${timestamp}-${pid}.txt`)
+
+		// Write the files
+		fs.writeFileSync(messagesFilePath, JSON.stringify(messages), "utf8")
+		fs.writeFileSync(systemPromptFilePath, systemPrompt, "utf8")
+
+		// Return paths and cleanup function
+		return {
+			messagesFilePath,
+			systemPromptFilePath,
+			cleanup: () => {
+				try {
+					fs.unlinkSync(messagesFilePath)
+					fs.unlinkSync(systemPromptFilePath)
+
+					// Try to remove the directory if it's empty (use newer rmSync)
+					try {
+						const files = fs.readdirSync(tempDirPath)
+						if (files.length === 0) {
+							fs.rmSync(tempDirPath, { recursive: true })
+						}
+					} catch (dirError) {
+						// Directory might not be empty or already removed, which is fine
+					}
+				} catch (error) {
+					console.error("Error cleaning up temporary Claude CLI files:", error)
+					// Don't re-throw to avoid breaking the main process
+				}
+			},
+		}
+	}
+
+	/**
+	 * Converts a Windows path to a WSL-compatible path
+	 * @param windowsPath The Windows path to convert
+	 * @returns The WSL-compatible path
+	 */
+	const convertWindowsPathToWsl = (windowsPath: string): string => {
+		// Validate that this is a Windows absolute path with drive letter
+		if (!windowsPath || windowsPath.length < 3 || windowsPath.charAt(1) !== ":") {
+			throw new Error(`Invalid Windows path format: ${windowsPath}`)
+		}
+
+		// Remove drive letter and convert backslashes to forward slashes
+		const driveLetter = windowsPath.charAt(0).toLowerCase()
+		const pathWithoutDrive = windowsPath.substring(2).replace(/\\/g, "/")
+		return `/mnt/${driveLetter}${pathWithoutDrive}`
+	}
+
 	// Create temporary files for messages and system prompt
 	const tempFiles = createTemporaryFiles(cwd, messages, systemPrompt)
 
@@ -279,6 +279,27 @@ function runClaudeCodeOnWindows({
 		// Clean up temporary files when the process exits
 		childProcess.finally(() => {
 			tempFiles.cleanup()
+		})
+
+		// Register cleanup handlers for process termination signals
+		const cleanupOnTermination = () => {
+			tempFiles.cleanup()
+			// Only attempt to kill the process if it's still running
+			if (childProcess && !childProcess.killed) {
+				childProcess.kill()
+			}
+		}
+
+		// Handle forceful termination by user
+		process.on("SIGINT", cleanupOnTermination)
+		process.on("SIGTERM", cleanupOnTermination)
+		process.on("exit", cleanupOnTermination)
+
+		// Remove the signal listeners when the child process completes
+		childProcess.finally(() => {
+			process.off("SIGINT", cleanupOnTermination)
+			process.off("SIGTERM", cleanupOnTermination)
+			process.off("exit", cleanupOnTermination)
 		})
 
 		return childProcess
